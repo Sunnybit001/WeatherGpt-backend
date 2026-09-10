@@ -1,0 +1,125 @@
+"""
+Historical weather & climate trend analysis, backed by Open-Meteo's
+Historical Weather API (daily data back to 1940, no API key required).
+
+This answers questions like "How has rainfall changed in Haryana over the
+last 20 years?" by pulling the daily archive, aggregating to yearly
+averages, and fitting a simple linear trend — the same
+fetch -> aggregate -> trend -> hand to LLM pipeline discussed for
+ERA5/IMD-based climate analysis, just swapped to a source that needs no
+account, download, or GPU.
+"""
+from datetime import date
+from typing import Any, Dict
+
+import httpx
+
+from app.config import get_settings
+
+settings = get_settings()
+
+VARIABLE_MAP = {
+    "rainfall": "precipitation_sum",
+    "precipitation": "precipitation_sum",
+    "temperature": "temperature_2m_mean",
+    "temp": "temperature_2m_mean",
+    "wind": "wind_speed_10m_max",
+}
+
+
+class HistoricalServiceError(Exception):
+    pass
+
+
+async def get_climate_trend(lat: float, lon: float, variable: str = "rainfall", period_years: int = 20) -> Dict[str, Any]:
+    period_years = max(2, min(period_years, 80))
+    daily_var = VARIABLE_MAP.get(variable.lower(), "precipitation_sum")
+
+    end = date.today()
+    start = date(end.year - period_years, 1, 1)
+
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "daily": daily_var,
+        "timezone": "auto",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(settings.OPEN_METEO_HISTORICAL_URL, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPError as exc:
+        raise HistoricalServiceError(f"Historical archive request failed: {exc}") from exc
+    except ValueError as exc:
+        raise HistoricalServiceError(f"Historical archive returned invalid JSON: {exc}") from exc
+
+    daily = data.get("daily", {})
+    dates = daily.get("time", [])
+    values = daily.get(daily_var, [])
+
+    yearly_sum: Dict[int, float] = {}
+    yearly_count: Dict[int, int] = {}
+    for d, v in zip(dates, values):
+        if v is None:
+            continue
+        year = int(d[:4])
+        yearly_sum[year] = yearly_sum.get(year, 0.0) + v
+        yearly_count[year] = yearly_count.get(year, 0) + 1
+
+    # For rainfall we want yearly totals; for temp/wind we want yearly means.
+    is_sum_metric = daily_var == "precipitation_sum"
+    yearly_averages: Dict[str, float] = {}
+    for year in sorted(yearly_sum):
+        if is_sum_metric:
+            yearly_averages[str(year)] = round(yearly_sum[year], 2)
+        else:
+            yearly_averages[str(year)] = round(yearly_sum[year] / yearly_count[year], 2)
+
+    trend_per_year = _linear_trend_slope(yearly_averages)
+    trend_summary = _summarize_trend(variable, trend_per_year, yearly_averages)
+
+    return {
+        "latitude": lat,
+        "longitude": lon,
+        "variable": variable,
+        "period_years": period_years,
+        "yearly_averages": yearly_averages,
+        "trend_per_year": round(trend_per_year, 4),
+        "trend_summary": trend_summary,
+    }
+
+
+def _linear_trend_slope(yearly_averages: Dict[str, float]) -> float:
+    """Ordinary least squares slope of value vs. year, no numpy required."""
+    if len(yearly_averages) < 2:
+        return 0.0
+
+    years = [int(y) for y in yearly_averages.keys()]
+    values = list(yearly_averages.values())
+    n = len(years)
+    mean_x = sum(years) / n
+    mean_y = sum(values) / n
+
+    numerator = sum((x - mean_x) * (y - mean_y) for x, y in zip(years, values))
+    denominator = sum((x - mean_x) ** 2 for x in years)
+
+    if denominator == 0:
+        return 0.0
+    return numerator / denominator
+
+
+def _summarize_trend(variable: str, slope: float, yearly_averages: Dict[str, float]) -> str:
+    if not yearly_averages:
+        return f"No historical {variable} data was available for this location."
+
+    direction = "increasing" if slope > 0 else "decreasing" if slope < 0 else "roughly flat"
+    first_year = min(yearly_averages)
+    last_year = max(yearly_averages)
+    return (
+        f"{variable.capitalize()} has been {direction} by approximately "
+        f"{abs(slope):.2f} units/year on average between {first_year} and {last_year}."
+    )
