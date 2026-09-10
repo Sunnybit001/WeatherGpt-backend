@@ -1,0 +1,127 @@
+"""
+Rule-based hazard risk engine.
+
+This mirrors the "Risk Engine (XGBoost + rules)" box from the original
+architecture: weather data goes in, a risk score/level comes out, and the
+LLM's only job is to *explain* the result, never to compute it.
+
+The scoring here is threshold-based so it works immediately with zero
+training data. To upgrade to a trained model later, keep this module's
+function signature (`assess`) the same and swap the body for
+`model.predict(features)` — nothing else in the app needs to change.
+"""
+from typing import Any, Dict
+
+from app.config import get_settings
+
+settings = get_settings()
+
+LEVELS = ["LOW", "MODERATE", "HIGH", "SEVERE"]
+
+
+def _score_to_level(score: int) -> str:
+    if score >= 75:
+        return "SEVERE"
+    if score >= 50:
+        return "HIGH"
+    if score >= 25:
+        return "MODERATE"
+    return "LOW"
+
+
+def _flood_score(max_precip_mm: float, precip_probability_pct: float) -> int:
+    score = 0
+    if max_precip_mm >= settings.FLOOD_RAIN_MM_SEVERE:
+        score = 90
+    elif max_precip_mm >= settings.FLOOD_RAIN_MM_HIGH:
+        score = 65
+    elif max_precip_mm >= settings.FLOOD_RAIN_MM_HIGH * 0.5:
+        score = 35
+    elif max_precip_mm > 0:
+        score = 10
+
+    # Probability nudges the score within its band.
+    prob_adjustment = round((precip_probability_pct or 0) / 100 * 10)
+    return min(100, score + prob_adjustment)
+
+
+def _cyclone_score(max_wind_kmh: float) -> int:
+    if max_wind_kmh >= settings.CYCLONE_WIND_KMH_SEVERE:
+        return 95
+    if max_wind_kmh >= settings.CYCLONE_WIND_KMH_HIGH:
+        return 65
+    if max_wind_kmh >= settings.CYCLONE_WIND_KMH_HIGH * 0.5:
+        return 30
+    if max_wind_kmh > 0:
+        return 10
+    return 0
+
+
+def _heatwave_score(max_temp_c: float) -> int:
+    if max_temp_c >= settings.HEATWAVE_TEMP_C_SEVERE:
+        return 90
+    if max_temp_c >= settings.HEATWAVE_TEMP_C_HIGH:
+        return 60
+    if max_temp_c >= settings.HEATWAVE_TEMP_C_HIGH - 5:
+        return 30
+    return 5
+
+
+def assess(forecast_days: list[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Takes the `days` list from weather_service.get_forecast() and returns
+    a risk assessment for the *worst* day in the window (i.e. the
+    peak-risk day), since that's what an early-warning system cares about.
+    """
+    if not forecast_days:
+        return {
+            "flood_score": 0,
+            "cyclone_score": 0,
+            "heatwave_score": 0,
+            "overall_level": "LOW",
+            "details": {"reason": "No forecast data available"},
+        }
+
+    best = {"flood": 0, "cyclone": 0, "heat": 0, "day": None}
+    for day in forecast_days:
+        flood = _flood_score(day.get("precipitation_sum_mm") or 0, day.get("precipitation_probability_max_pct") or 0)
+        cyclone = _cyclone_score(day.get("wind_speed_max_kmh") or 0)
+        heat = _heatwave_score(day.get("temp_max_c") or 0)
+
+        if flood > best["flood"] or cyclone > best["cyclone"] or heat > best["heat"]:
+            if flood >= best["flood"]:
+                best["flood"] = flood
+                best["flood_day"] = day.get("date")
+            if cyclone >= best["cyclone"]:
+                best["cyclone"] = cyclone
+                best["cyclone_day"] = day.get("date")
+            if heat >= best["heat"]:
+                best["heat"] = heat
+                best["heat_day"] = day.get("date")
+
+    overall_score = max(best["flood"], best["cyclone"], best["heat"])
+    overall_level = _score_to_level(overall_score)
+
+    return {
+        "flood_score": best["flood"],
+        "cyclone_score": best["cyclone"],
+        "heatwave_score": best["heat"],
+        "overall_level": overall_level,
+        "details": {
+            "peak_flood_day": best.get("flood_day"),
+            "peak_cyclone_day": best.get("cyclone_day"),
+            "peak_heat_day": best.get("heat_day"),
+            "thresholds_mm_rain": {
+                "high": settings.FLOOD_RAIN_MM_HIGH,
+                "severe": settings.FLOOD_RAIN_MM_SEVERE,
+            },
+            "thresholds_wind_kmh": {
+                "high": settings.CYCLONE_WIND_KMH_HIGH,
+                "severe": settings.CYCLONE_WIND_KMH_SEVERE,
+            },
+            "thresholds_temp_c": {
+                "high": settings.HEATWAVE_TEMP_C_HIGH,
+                "severe": settings.HEATWAVE_TEMP_C_SEVERE,
+            },
+        },
+    }
